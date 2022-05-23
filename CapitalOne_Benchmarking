@@ -1,0 +1,967 @@
+# BEGIN: LIBRARIES, which are required for all code in this script
+SHOWLIB<-TRUE;if (SHOWLIB==TRUE){
+  library(dplyr)
+  library(sqldf)
+  library(quantmod)
+  library(timeDate)
+  library(lubridate)
+  library(RODBC)
+  library(openxlsx)
+  library(rmarkdown)
+  library(knitr)
+  library(kableExtra)
+  library(forecast)
+  library(stringr)
+  library(keyring)
+  options(scipen=999)
+}
+# END: LIBRARIES
+
+# Define Report Date
+REPORTDATE<-'2022-04-30'
+
+# BEGIN: DATA PULL
+DATAPULL<-TRUE;if(DATAPULL){
+  #ADESA WHOLE CAR offer/sales for CapitalOne and Cohort
+  SNOWFLAKE_dbConnection<-odbcConnect("snowflake_azure", pwd = key_get('SNOWFLAKE'))
+ # Adesa sale data
+  capitalone.sql<-function(sale_date){paste0("WITH
+                                offered as (
+                                  select distinct 
+                                             wc.vin
+                                            ,wc.odometer_mi
+                                            ,wc.sale_date as offered_date
+                                            ,date_trunc('week', wc.sale_date) AS offer_week
+                                            ,(DATE_TRUNC('week', DATEADD(week, 1, wc.sale_date))) AS offer_week_end
+                                            ,LAST_DAY(wc.sale_date) as offer_month
+                                            ,wc.floor_price
+                                            ,wc.autograde as autograde_current
+                                            ,wc.enterprise_seller_name  
+                                            ,wc.seller_name
+                                            ,wc.auction_name
+                                            --,insp.inspection_daterge
+                                            --,insp.drivable_indicator
+                                            ,ann.sellerannouncements
+                                            ,ann.inspection_date
+                                            ,ann.vehicle_grade
+                                            ,ann.driveable
+                                            ,ann.salvage
+                                            
+                                            from ADESA_SHARE.CERTIFIED_ANALYTICS.WHOLE_CAR_OFFERED_AND_SOLD wc
+                                            left join (select distinct vin,vehicleid,upper(seller) as seller,mileage,ROUND(CAST(vehicle_grade as decimal(3,2)),1) as vehicle_grade
+                                            ,inspection_date
+                                            ,IFNULL(sellerannouncements,'empty') as sellerannouncements
+                                            ,driveable
+                                            ,salvage
+                                            ,row_number() over (partition by vin,vehicleid,mileage,vehicle_grade order by sale_date asc) as ann_num
+                                            from PROD.RAW_RTI.RTI_VEHICLES 
+                                            where seller IS NOT NULL) ann 
+                                            on ann.vin=wc.vin 
+                                            and ann.vehicle_grade=wc.autograde
+                                            and ann.mileage=wc.odometer_mi
+                                           
+                                            where wc.sale_date between '",sale_date,"'::date -interval '12 months' + interval '1 day' and '",sale_date,"'
+                                            AND wc.odometer_mi > 0
+                                            AND wc.AUCTION_COUNTRY = 'UNITED STATES'
+                                            AND wc.ENTERPRISE_CATEGORY in ('In Lane','Simulcast')
+                                            AND wc.ENTERPRISE_CHANNEL = 'At Auction'
+                                            --AND ann.ann_num=1
+                                            --and dv.vin='19UDE2F73GA006724'
+ ),
+                                            
+                                            amg as (select distinct 
+                                            api.session_id,
+                                            api.row_id,
+                                            api.create_date_time,
+                                            api.vin,
+                                            f.make_nm,
+                                            f.model_nm,
+                                            f.my,
+                                            f.mileage,
+                                            f.vehicle_grade,
+                                            f.age,
+                                            f.msrp,
+                                            f.trim_nm,
+                                            f.analytical_region,
+                                            date_trunc('week', f.sale_date) AS sale_week,
+                                            sp.sale_date,
+                                            f.dcurve,
+                                            f.historical_price,
+                                            p.predicted_ratio,
+                                            p.predicted_price as AMG_price,
+                                            p.predicted_high,
+                                            p.predicted_low,
+                                            sp.sale_price,
+                                            api.client_name
+                                            
+                                            from PROD.STG_PRC_AMG_US.v_API_CALL api
+                                            left join PROD.STG_PRC_AMG_US.v_FEATURE f on f.session_id=api.session_id and f.row_id=api.row_id and f.vin=api.vin
+                                            left join PROD.STG_PRC_AMG_US.v_PREDICTED_PRICE p on p.session_id=api.session_id and p.row_id=api.row_id and p.vin=api.vin
+                                            left join (select ca.vin,ca.sale_price,ca.sale_date,
+                                                       date_trunc('week', ca.sale_date) AS sale_week
+                                                       from ADESA_SHARE.CERTIFIED_ANALYTICS.WHOLE_CAR_OFFERED_AND_SOLD ca
+                                    
+                                                       where  ca.transaction_type='Sold') sp
+                                            on api.vin=sp.vin and sp.sale_week=date_trunc('week', f.sale_date)
+                                            where api.client_name in ('AMG_BENCHMARK')
+                                            )
+                                            
+                                            --Main Query
+                                            
+                                            select distinct amg.*,
+                                            offered.offer_week,
+                                            offered.offer_month,
+                                            offered.floor_price,
+                                            offered.seller_name,
+                                            offered.enterprise_seller_name,
+                                            offered.auction_name,
+                                            offered.driveable,
+                                            offered.salvage,
+                                            offered.sellerannouncements
+                                            
+                                            from amg
+                                            inner join offered on offered.vin=amg.vin 
+                                            and offered.odometer_mi::float=amg.mileage::float 
+                                            and offered.offer_week::date=amg.sale_week::date
+                                            where offered.enterprise_seller_name in ('CREDIT ACCEPTANCE'                      
+                                                                       ,'SANTANDER'                
+                                                                       ,'PAR'                                    
+                                                                       ,'CAPITAL ONE'                             
+                                                                       ,'AMERICAN CREDIT ACCEPTANCE'             
+                                                                       ,'ALLY'                                    
+                                                                       ,'BMW'                                     
+                                                                       ,'ONEMAIN'                                  
+                                                                       ,'CHASE AUTO FINANCE'                      
+                                                                       ,'WELLS FARGO AUTO'                         
+                                                                       ,'VCI/AUDI'                                
+                                                                       ,'LOBEL FINANCIAL'                         
+                                                                       ,'DRIVE TIME'                               
+                                                                       ,'OTHER'                                    
+                                                                       ,'VEROS CREDIT'                            
+                                                                       ,'TRUIST'                                   
+                                                                       ,'US BANK'                                 
+                                                                       ,'UNITED AUTO CREDIT CORP'                  
+                                                                       ,'PRIMERITUS FINANCIAL SERVICES'           
+                                                                       ,'GRIFFIN TIRE & BATTERY'                  
+                                                                       ,'EXETER FINANCE'                          
+                                                                       ,'CPS'                                      
+                                                                       ,'NAVY FEDERAL CREDIT UNION'                
+                                                                       ,'AUTOMOTIVE CREDIT CORPORATION'            
+                                                                       ,'BANK OF THE WEST'                         
+                                                                       ,'HUNTINGTON'                                
+                                                                       ,'BANK OF AMERICA'                           
+                                                                       ,'FIFTH THIRD'                                
+                                                                       ,'TITLEMAX'                                   
+                                              ) 
+                                              OR
+                                            offered.seller_name in ('CAPITAL ONE AUTO FINANCE' 
+                                            ,'CAPITAL ONE AUTO FINANCE**' 
+                                            ,'SANTANDER CONSUMER'                      
+                                            ,'PAR NORTH AMERICA'                       
+                                            ,'SANTANDER CONSUMER USA'                  
+                                            ,'WELLS FARGO DEALER SERVICES'             
+                                            ,'AMERICAN CREDIT ACCEPTANCE'              
+                                            ,'EXETER FINANCE LLC'                      
+                                            ,'ALLY FINANCIAL INC.'                     
+                                            ,'JPMORGAN CHASE BANK N.A. RETAIL'         
+                                            ,'ALLY FINANCIAL INC'                      
+                                            ,'US AUTO FINANCE INC'                     
+                                            ,'REGIONAL ACCEPTANCE CORPORATION'         
+                                            ,'CONSUMER PORTFOLIO SERVICES'             
+                                            ,'NAVY FEDERAL CREDIT UNION'               
+                                            ,'BANK OF THE WEST'                        
+                                            ,'FIFTH THIRD BANK  REPO'                  
+                                            ,'MT BANK'                                 
+                                            ,'HUNTINGTON NATIONAL BANK'                
+                                            ,'CAPITAL ONE COAF'                        
+                                            ,'HUNTINGTON NATIONAL BANK  REPO'          
+                                            ,'SUN TRUST BANK'                          
+                                            ,'PNC BANK'                                
+                                            ,'REGIONAL ACCEPTANCE CORP'                
+                                            ,'FIFTH THIRD BANCORP'                     
+                                            ,'WELLS FARGO BANK N A  AUTO FINANCE GROUP'
+                                            ,'BANK OF AMERICA NA'                      
+                                            ,'US BANK REPOS'                           
+                                            ,'US BANK'                                 
+                                            ,'BANK OF AMERICA'                         
+                                            ,'FIFTH THIRD BANK')
+                                             ")
+  }
+  capitalone.df<-sqlQuery(SNOWFLAKE_dbConnection,capitalone.sql(REPORTDATE),stringsAsFactors=FALSE)
+  names(capitalone.df)<-tolower( names(capitalone.df))
+ # External data scored data (Client provided)
+ capitalone_snow.sql<-function(sale_date){paste("select distinct 
+                                            api.session_id,
+                                            api.row_id,
+                                            api.create_date_time,
+                                            api.vin,
+                                            f.make_nm,
+                                            f.model_nm,
+                                            f.my,
+                                            f.mileage,
+                                            f.vehicle_grade,
+                                            f.age,
+                                            f.msrp,
+                                            f.trim_nm,
+                                            f.analytical_region,
+                                            f.sale_date,
+                                            date_trunc('week', f.sale_date) AS sale_week,
+                                            f.dcurve,
+                                            f.historical_price,
+                                            p.predicted_ratio,
+                                            p.predicted_price_adj as AMG_price,
+                                            p.predicted_high,
+                                            p.predicted_low,
+                                            api.client_name
+                                            
+                                            from PROD.STG_PRC_AMG_US.v_API_CALL api
+                                            left join PROD.STG_PRC_AMG_US.v_FEATURE f on f.session_id=api.session_id and f.row_id=api.row_id and f.vin=api.vin
+                                            left join PROD.STG_PRC_AMG_US.v_PREDICTED_PRICE p on p.session_id=api.session_id and p.row_id=api.row_id and p.vin=api.vin
+                                          /*  left join (select ca.vin,ca.sale_price,ca.sale_date,
+                                                       date_trunc('week', ca.sale_date) AS sale_week
+                                                       from ADESA_SHARE.CERTIFIED_ANALYTICS.WHOLE_CAR_OFFERED_AND_SOLD ca
+                                                       where  ca.transaction_type='Sold') sp
+                                            on api.vin=sp.vin and sp.sale_week=date_trunc('week', f.sale_date)
+                                        */    
+                                            where api.client_name='BENCHMARK_EXTERNAL'
+                                            --and sp.sale_price IS NULL
+                                            and p.predicted_price > 0
+                                            and f.sale_date between '",sale_date,"'::date -interval '12 months' + interval '1 day' and '",sale_date,"'",sep='')
+ }
+ capone_manheim.sql<-function(sale_date){paste("select 
+                                              eb.vin
+                                              ,eb.make as make_nm            
+                                              ,eb.model as model_nm
+                                              ,eb.model_year as my
+                                              ,eb.mileage
+                                              ,eb.condition_grade as vehicle_grade
+                                              ,DATEDIFF(MONTHS,((eb.model_year::INT - 1)::TEXT || '-09-01')::DATE,eb.sale_date::DATE) as age
+                                              ,f.msrp
+                                              ,eb.series as trim_nm
+                                              ,eb.region as analytical_region  
+                                              ,date_trunc('week', eb.sale_date) AS sale_week
+                                              ,eb.sale_date
+                                              ,f.dcurve
+                                              ,f.historical_price
+                                              ,eb.amg_price/f.msrp as predicted_ratio
+                                              ,eb.amg_price       
+                                              ,eb.amg_price_high    
+                                              ,eb.amg_price_low
+                                              ,eb.sale_price
+                                              ,'' as client_name
+                                              ,date_trunc('week', eb.sale_date) as offer_week
+                                              ,date_trunc('month', eb.sale_date) as offer_month
+                                              ,'' as floor_price
+                                              ,'CAPITAL ONE AUTO FINANCE' as seller_name
+                                              ,'CAPITAL ONE' as enterprise_seller_name
+                                              ,eb.auction_name 
+                                              ,eb.drivable  as driveable
+                                              ,'' as salvage
+                                              ,'' as sellerannouncements
+                                              
+    from SBX_NICHOLAS_HINKLEY.BENCHMARK.EXTERNAL_BENCHMARK eb
+    inner join PROD.STG_PRC_AMG_US.v_FEATURE f on f.vin=eb.vin and f.sale_date=eb.sale_date
+    where market = 'MANHEIM'
+          and SELLER_NAME = 'CAPONE'
+          and eb.sale_date between '",sale_date,"'::date -interval '12 months' + interval '1 day' and '",sale_date,"'",sep='')}
+ capitalone_manheim.df<-sqlQuery(SNOWFLAKE_dbConnection, capone_manheim.sql(REPORTDATE),stringsAsFactors=FALSE)
+ names(capitalone_manheim.df)<-tolower(names(capitalone_manheim.df))
+ # Append Manheim and Adesa Sales 
+ capitalone_red.df<-subset(capitalone.df , select = c(intersect(names(capitalone.df),names(capitalone_manheim.df))))
+ capitalone_manheim_red.df<-subset(capitalone_manheim.df , select = c(intersect(names(capitalone.df),names(capitalone_manheim.df))))
+ 
+                              
+ capitalone_portfolio<-data.frame(capitalone_red.df %>% union_all(capitalone_manheim_red.df)
+                                  %>% mutate(market = ifelse(grepl("ADESA", auction_name),"ADESA","OTHER"))
+ )
+ 
+  
+
+  } 
+# END: DATA PULL
+
+# BEGIN: Metrics
+METRICS<-TRUE;if(METRICS==T){
+  capitalone_portfolio$sale_date<-as.Date(capitalone_portfolio$sale_date)
+  capitalone_portfolio$sale_week<-as.Date(capitalone_portfolio$sale_week)
+  capitalone_portfolio$offer_week<-as.Date(capitalone_portfolio$offer_week)
+  capitalone_portfolio$offer_month<-as.Date(capitalone_portfolio$offer_month)
+  
+  #Remove vins with multiple per day records
+  tail(sort(apply(table(capitalone_portfolio$vin,capitalone_portfolio$sale_date),1,max)))
+  capitalone_portfolio<-capitalone_portfolio %>% distinct()
+  tail(sort(apply(table(capitalone_portfolio$vin,capitalone_portfolio$sale_date),1,max)))
+  
+  dups<-subset((data.frame(capitalone_portfolio %>% 
+                             mutate(vindate = paste(vin,':',sale_date)) %>%
+                             dplyr::group_by(vindate) %>% 
+                             summarise(N = max(length(vindate))
+                             ))),N>1)
+  NROW(dups)
+  
+  if(NROW(dups)>0){
+    adds<-subset(capitalone_portfolio,(paste(capitalone_portfolio$vin,':',capitalone_portfolio$sale_date) %in% dups$vindate))
+    adds<-unique(adds)
+    adds$client_name_pos<-ifelse(is.na(adds$client_name),1,NA)
+    adds$ann_length<-nchar(adds$sellerannouncements)
+    adds<-data.frame(adds %>% dplyr::group_by(vin,sale_date) 
+                     %>% arrange(sale_price,floor_price,vehicle_grade,client_name_pos,ann_length) 
+                     %>% mutate(pred_n=row_number())
+                     %>% filter(pred_n==1))
+    adds<-subset(adds,select=c(names(capitalone_portfolio)))                   
+    
+    capitalone_portfolio<-subset(capitalone_portfolio,!(paste(capitalone_portfolio$vin,':',capitalone_portfolio$sale_date) %in% dups$vindate))
+    capitalone_portfolio<-rbind(capitalone_portfolio,adds)
+  }
+  all(sort(table(paste(capitalone_portfolio$vin,capitalone_portfolio$sale_date,sep=':')))==1)
+  
+  #ETL
+  
+  #fix FARGO customer name
+  #capitalone_portfolio$customer_name<-ifelse(capitalone_portfolio$customer_name=='CAPITAL ONE AUTO FINANCE**','CAPITAL ONE AUTO FINANCE',capitalone_portfolio$customer_name)
+  #fix ADESA SACRAMENTO BRASHER'S'/ADESA BRASHERS Auctions
+  #capitalone_portfolio$process_location_name<-ifelse(capitalone_portfolio$auction_name%in% c('ADESA SACRAMENTO BRASHER\'S','ADESA SACRAMENTO','ADESA BRASHERS'),'ADESA SACRAMENTO',capitalone_portfolio$auction_name)
+  
+  
+  #Add Grouping
+  capitalone_portfolio$sellgroup<-ifelse(capitalone_portfolio$seller_name %in% c('CAPITAL ONE AUTO FINANCE','CAPITAL ONE AUTO FINANCE**') | 
+                                           capitalone_portfolio$enterprise_seller_name %in% c('CAPITAL ONE'), 'CAPITAL_ONE','Cohort')
+  #Add market flag
+  #capitalone_portfolio$market<-ifelse(grepl("ADESA", capitalone_portfolio$auction_name),"ADESA","OTHER")
+  #Add sold flag
+  capitalone_portfolio$status<-ifelse(is.na(capitalone_portfolio$sale_price),'outstanding','sold')
+  #Add drivable flag
+  capitalone_portfolio$isdrivable<-ifelse((capitalone_portfolio$driveable=='Yes' | capitalone_portfolio$driveable=='' | is.na(capitalone_portfolio$driveable)) ,1,0)
+   
+  #restrict to ADESA AUCTIONS
+  #capitalone_portfolio<-data.frame(capitalone_portfolio %>% filter(market == 'ADESA'))
+  
+  #define customer_name
+  capitalone_portfolio$customer_name<-capitalone_portfolio$enterprise_seller_name
+  
+  #reduce outlying floor prices greater than 120% of msrp
+  capitalone_portfolio<-  capitalone_portfolio %>% filter(floor_price<msrp*1.2 | is.na(floor_price))
+  
+                                            
+  
+  overall<-data.frame(capitalone_portfolio %>% 
+                        filter(market %in% ('ADESA') 
+                               & isdrivable == 1
+                               & (sale_price>1000 | is.na(sale_price)) 
+                               & amg_price>1000 
+                               & (floor_price>1000 | is.na(floor_price))
+                        ) %>%
+                        dplyr::group_by(sellgroup) %>%
+                        summarise(sold = sum(status=='sold')
+                                  ,offered = sum(length(vin))
+                                  ,conversion = round(sum(status=='sold')/length(vin)*100,1)
+                                  ,avg_price = round(mean(sale_price,na.rm=T),0)
+                                  ,avg_floorRet = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                                  ,avg_AMGRet = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                                  
+                        ) %>% arrange(sellgroup) 
+  ) 
+  overall
+  
+  byMonth<-data.frame(capitalone_portfolio %>% 
+                        filter(market=='ADESA' 
+                               & isdrivable == 1
+                               & (sale_price>1000 | is.na(sale_price)) 
+                               & amg_price>1000 
+                               & (floor_price>1000 | is.na(floor_price))
+                               ) %>%
+                        dplyr::group_by(sellgroup,offer_month) %>%
+                        summarise(sold = sum(status=='sold')
+                                  ,offered = sum(length(vin))
+                                  ,conversion = round(sum(status=='sold')/length(vin)*100,1)
+                                  ,avg_price = round(mean(sale_price,na.rm=T),0)
+                                  ,avg_floorRet = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                                  ,avg_AMGRet = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                                  
+                        ) %>% arrange(sellgroup) 
+  ) 
+  byMonth
+  
+  
+  
+  #byWeek
+  byWeek<-data.frame(capitalone_portfolio 
+                     %>% filter(market=='ADESA' 
+                         & isdrivable == 1
+                         & floor_price>300
+                     ) %>%
+    dplyr::group_by(sellgroup,offer_week) %>%
+    summarise( conversion = round(sum(status=='sold')/length(vin)*100,0)
+               
+               ,avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+               ,avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+               
+    ) %>% arrange(sellgroup,desc(offer_week)) ) 
+  byWeek
+  
+  
+  #data summaries
+  byYTD<- data.frame(capitalone_portfolio %>% 
+                       filter(market=='ADESA' 
+                              & isdrivable == 1
+                              & (floor_price>300)
+                              & offer_week >= '2022-01-01') %>%
+                       dplyr::group_by(sellgroup) %>%
+                       summarise(
+                         offered = length(vin)
+                         ,sold = sum(status=='sold')
+                         ,conversion = sum(status=='sold')/length(vin)
+                         ,avg_AMG = round(mean(amg_price,na.rm=T),0)
+                         ,avg_floor = round(mean(floor_price,na.rm=T),0)
+                         ,avg_sale = round(mean(sale_price,na.rm=T),0)
+                         ,avg_msrp = round(mean(msrp,na.rm=T),0)
+                         ,avg_age = round(mean(age,na.rm=T),1)
+                         ,avg_mileage = round(mean(mileage,na.rm=T),0)
+                         ,avg_grade = round(mean(vehicle_grade,na.rm=T),1)
+                         
+                         ,ME = round(mean((amg_price-sale_price),na.rm=T),0)
+                         ,AMG_MAD = round(mad((amg_price/sale_price)-1,na.rm=T),2)
+                         
+                         ,avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                         ,avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                         
+                         ,locations= length(unique(auction_name))
+                       )) 
+  
+  
+  
+  
+  byGroup<- data.frame(capitalone_portfolio %>% 
+                         filter(market=='ADESA' 
+                                & isdrivable == 1
+                                & floor_price>300) %>%
+                         dplyr::group_by(sellgroup) %>%
+                         summarise(
+                           offered = length(vin)
+                           ,sold = sum(status=='sold')
+                           ,conversion = sum(status=='sold')/length(vin)
+                           ,avg_AMG = round(mean(amg_price,na.rm=T),0)
+                           ,avg_floor = round(mean(floor_price,na.rm=T),0)
+                           ,avg_price = round(mean(sale_price,na.rm=T),0)
+                           
+                           ,ME = round(mean((amg_price-sale_price),na.rm=T),3)
+                           ,AMG_MAD = round(mad((amg_price/sale_price)-1,na.rm=T),3)
+                           
+                           ,avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                           ,avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                           
+                           ,locations= length(unique(auction_name))
+                         )) 
+  
+  byGroup
+  
+  
+  byLocation<- data.frame(capitalone_portfolio %>% 
+                            filter(sellgroup=='CAPITAL_ONE' 
+                                   & isdrivable == 1
+                        ) %>%
+                          dplyr::group_by(auction_name) %>%
+                          summarise(
+                            auctions = length(unique(sale_date))
+                            ,offered = length(vin[market=='ADESA'])
+                            ,sold = sum(status=='sold')
+                            ,conversion = sum(status=='sold')/length(vin[market=='ADESA'])
+                            ,avg_price = round(mean(sale_price,na.rm=T),0)
+                            ,avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                            ,avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                          ) %>%
+                          filter(sold>50) %>%
+                          arrange(desc(auctions))
+                ) 
+                        
+  byLocation[sapply(byLocation, is.nan)] <- NA
+  byLocation[sapply(byLocation, is.infinite)] <- NA
+  byLocation$offered[byLocation$offered==0] <- NA
+  
+  byLocation_month<- data.frame(capitalone_portfolio %>% filter(sellgroup=='CAPITAL_ONE' 
+                                                        & isdrivable == 1
+                                                        & offer_month==max(offer_month)
+                                                       
+ ) %>%
+    dplyr::group_by(auction_name) %>%
+    summarise(
+      auctions = length(unique(sale_date))
+      ,offered = length(vin)
+      ,sold = sum(status=='sold')
+      ,conversion = sum(status=='sold')/length(vin)
+      ,avg_price = round(mean(sale_price,na.rm=T),0)
+      ,avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+      ,avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+    ) %>% filter(sold>15)) 
+  
+  byLocation_month<-byLocation_month[order(as.numeric(byLocation_month$offered),decreasing=T),]
+  byLocation_month[sapply(byLocation_month, is.nan)] <- NA
+  byLocation_month[sapply(byLocation_month, is.infinite)] <- NA
+  byLocation_month$offered[byLocation_month$offered==0] <- NA
+  
+  
+  byCAP1<- data.frame(capitalone_portfolio %>% filter(isdrivable == 1
+                                              & (floor_price > 300 | is.na(floor_price))
+                                              & sellgroup=='CAPITAL_ONE') %>%
+                        dplyr::group_by(auction_name) %>%
+                        summarise(
+                           Cap1_auctions = length(unique(sale_date))
+                          
+                          ,Cap1_offered = length(vin[market=='ADESA'])
+                          ,Cap1_sold = sum(status=='sold')
+                          ,Cap1_conversion = round(sum(status=='sold')/length(vin[market=='ADESA']),3)
+                          ,Cap1_avg_price = round(mean(sale_price,na.rm=T),0)
+                          
+                          ,Cap1_avg_msrp = round(mean(msrp,na.rm=T),0)
+                          ,Cap1_avg_age = round(mean(age,na.rm=T),1)
+                          ,Cap1_avg_mileage = round(mean(mileage,na.rm=T),0)
+                          ,Cap1_avg_grade = round(mean(vehicle_grade,na.rm=T),1)
+                          
+                          ,Cap1_avg_AMG = round(mean(amg_price,na.rm=T),0)
+                          ,Cap1_avg_floor = round(mean(floor_price,na.rm=T),0)
+                          
+                          ,Cap1_avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                          ,Cap1_avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                          
+                        ) %>% filter(Cap1_auctions>4 & Cap1_sold>50) 
+                        %>% arrange(desc(Cap1_offered))
+                      ) 
+  
+  byCAP1[sapply(byCAP1, is.nan)] <- NA
+  byCAP1[sapply(byCAP1, is.infinite)] <- NA
+  byCAP1$Cap1_offered[byCAP1$Cap1_offered==0] <- NA
+  
+  
+  byCohort<- data.frame(capitalone_portfolio %>% filter(isdrivable == 1
+                                                & (floor_price > 300 | is.na(floor_price))
+                                                & sellgroup=='Cohort') %>%
+                          dplyr::group_by(auction_name) %>%
+                          summarise(
+                            Adesa_auctions = length(unique(sale_date))
+                            
+                            ,Adesa_offered = length(vin)
+                            ,Adesa_sold = sum(status=='sold')
+                            ,Adesa_conversion = round(sum(status=='sold')/length(vin),3)
+                            ,Adesa_avg_price = round(mean(sale_price,na.rm=T),0)
+                            
+                            ,Adesa_avg_msrp = round(mean(msrp,na.rm=T),0)
+                            ,Adesa_avg_age = round(mean(age,na.rm=T),1)
+                            ,Adesa_avg_mileage = round(mean(mileage,na.rm=T),0)
+                            ,Adesa_avg_grade = round(mean(vehicle_grade,na.rm=T),1)
+                            
+                            
+                            ,Adesa_avg_AMG = round(mean(amg_price,na.rm=T),0)
+                            ,Adesa_avg_floor = round(mean(floor_price,na.rm=T),0)
+                            
+                            ,Adesa_avg_floor_ret = round(mean(sale_price/floor_price,na.rm=T)*100,0)
+                            ,Adesa_avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                          )) 
+  
+  
+  byCohort
+  
+  byAll<- data.frame(capitalone_portfolio %>% 
+                   filter(isdrivable == 1
+                    & (floor_price > 300 | is.na(floor_price))
+                    & auction_name%in% c(unique(byCohort$auction_name),unique(byCAP1$process_location_name))
+                  ) %>%
+                  dplyr::group_by(auction_name) %>%
+                  summarise(
+                    Total_offered = length(vin[market=='ADESA'])
+                    ,Total_conversion = round(sum(status=='sold')/length(vin[market=='ADESA']),3)
+                    ,Total_avg_AMG_ret = round(mean(sale_price[!is.na(amg_price)]/amg_price[!is.na(amg_price)],na.rm=T)*100,0)
+                  ) 
+           ) 
+  
+  byAll[sapply(byAll, is.nan)] <- NA
+  byAll[sapply(byAll, is.infinite)] <- NA
+  byAll$Total_offered[byAll$Total_offered==0] <- NA
+  
+  
+  byAll
+  
+  #Combine CAP1 and Cohort
+  C1report<-merge(byAll,byCohort,by="auction_name",all.x=T)
+  C1report<-merge(C1report,byCAP1,by="auction_name",all.x=T)
+  C1report<-C1report[order(C1report$Cap1_avg_AMG_ret, decreasing=T),]
+  C1report<-sqldf("select auction_name as Auction
+                  ,Total_offered
+                  ,Total_conversion
+                  ,Total_avg_AMG_ret as Total_Retention
+                  ,Adesa_offered as Adesa_N            
+                  ,Adesa_avg_msrp     
+                  ,Adesa_avg_age     
+                  ,Adesa_avg_mileage  
+                  ,Adesa_avg_grade    
+                  ,Adesa_avg_price as Adesa_avg_saleprice
+                  ,Adesa_avg_AMG_ret as Adesa_AMG_retention
+                  ,Adesa_conversion
+                  ,Cap1_offered as Cap1_N             
+                  ,Cap1_avg_msrp      
+                  ,Cap1_avg_age       
+                  ,Cap1_avg_mileage   
+                  ,Cap1_avg_grade     
+                  ,Cap1_avg_price as Cap1_avg_saleprice 
+                  ,Cap1_avg_AMG_ret as Cap1_AMG_retention
+                  ,Cap1_conversion
+                  from 'C1report'")
+  
+  #Market Opportunity
+  
+  opportunity<-data.frame(byCohort %>% filter(       
+                      !(auction_name%in% unique(byCAP1$auction_name))
+                      & Adesa_sold>25 
+                      & Adesa_avg_AMG_ret > mean(byCAP1$Cap1_avg_AMG_ret,na.rm=T)-1
+                      & Adesa_conversion > mean(byCAP1$Cap1_conversion,na.rm=T)-0.03
+                      ) %>% select(auction_name,Adesa_conversion,Adesa_avg_price
+                              ,Adesa_avg_AMG_ret,Adesa_avg_floor_ret)
+                      %>% arrange(desc(Adesa_avg_AMG_ret))
+               )
+
+  #Unsold
+  byUNSOLD<- data.frame(capitalone_portfolio %>%
+                        filter(isdrivable == 1
+                                  & floor_price > 300
+                                  & sellgroup=='CAPITAL_ONE'
+                                  & market=='ADESA')
+                        %>% dplyr::group_by(auction_name) %>%
+                summarise(
+                unsold = length(vin[status=='outstanding'])
+                ,unsoldPct = round(1-(sum(status=='sold')/length(vin)),3)
+                ,avg_sale = round(mean(sale_price,na.rm=T),0)
+                ,avg_AMG_unsold = round(mean(amg_price[status=='outstanding'],na.rm=T),0)
+                ,avg_floor_unsold = round(mean(floor_price[status=='outstanding'],na.rm=T),0)
+                ,sold_floorAMG_ratio = round(mean(floor_price[status=='sold']/amg_price[status=='sold'],na.rm=T)*100,0)
+                ,unsold_floorAMG_ratio = round(mean(floor_price[status=='outstanding']/amg_price[status=='outstanding'],na.rm=T)*100,0)
+                 ) %>% arrange(desc(unsoldPct))
+              ) 
+  
+   byUNSOLD
+  }
+# END: MetricsbyCurrentM
+  
+# BEGIN: Export
+EXPORT=T;if(EXPORT==T){
+  #clean announcements
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = ";OWNER.*,")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "OWNER.*;")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SANTANDER")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "PAR")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "NAAA")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SKOPOS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "WFDS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ALASKA USA")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "GOLDEN 1")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "KITSAP")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "STATE FARM BANK")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "GOLDEN ONE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "BMO HARRIS BANK")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "BALBOA THRIFT & LOAN")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "TDECU")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SPACE COAST")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CREDIT UNION")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "APPLE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FEDERAL")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FCU")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "UNIVERSITY")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CU")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FRONTWAVE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FINANCIAL")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CHRYSLER")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ALLIANT")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "NASA")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "COAST HILLS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ALLIED SOLUTIONS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "LOANMART")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "UNIFY")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "LLC")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CENTER STREET")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "AMERICAN")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ENCORE AUTOMOTIVE ACCEPTANCE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "INSPIRUS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SUMMIT")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ALTURA")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "HEIGHTS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "VALLEY")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "OPENLANE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FINANCE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "OWNER")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "WELLS FARGO")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "INTEGON NATIONAL")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CONVEYANCE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "NATIONAL")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "BANK")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ALTAONE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "KINECTA")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "ADVANTAGE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "HNB")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "EXCHANGE")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "TYNDALL")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "MCGRAW HILL")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "NUVISION")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "WESTERRA")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "TEXAS DOW EMPLOYEES")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SERIAN")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FARM")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CITIZENS")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SANTNADER")
+  
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "GENERAL INSURANCE CORPORATION")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "PENTAGON")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "FAIR TITLING")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "SUNTRUST")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "LOAN")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "THRIFT")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "COMMUNITY")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "TRUST")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "COMPANY")
+  capitalone_portfolio$sellerannouncements<-str_remove_all(toupper(capitalone_portfolio$sellerannouncements),pattern = "CREDIT")
+  
+  VinDetails<-sqldf("select
+                    seller_name
+                    ,vin
+                    ,floor_price
+                    ,substr(vin,1,10) as vin10
+                    ,sellgroup
+                    ,auction_name
+                    ,analytical_region
+                    ,make_nm
+                    ,model_nm
+                    ,my
+                    ,mileage
+                    ,age as age_in_months
+                    ,vehicle_grade
+                    ,msrp 
+                    ,status
+                    ,sale_date as sale_date__Date 
+                    ,sale_price
+                    ,amg_price as AMG_value
+                    ,sale_price/amg_price as AMG_retention
+                    ,isdrivable
+                    ,sellerannouncements
+                    from 'capitalone_portfolio'",method = "name__class")
+  
+  #write.csv(VinDetails,paste("F:/SharedFolders/TW/CapitalOne/CapitalOne_Portfolio_Details_asof_",as.Date(Sys.Date()),"_overLast_",substring((max(capitalone_portfolio$sale_date)-min(capitalone_portfolio$sale_date)),1,3),"days.csv",sep=""))
+  
+  wb <- createWorkbook()
+  getOption("openxlsx.dateFormat", "mm/dd/yyyy")
+  hs <- createStyle(halign = "center", valign = "center", textDecoration = "Bold",
+                    border = "TopBottomLeftRight")
+  
+  addWorksheet(wb, sheetName="Summary")
+  addWorksheet(wb, sheetName="VinDetails")
+  
+  
+  setColWidths(wb,sheet = 1,cols = 1, widths = 30)
+  setColWidths(wb,sheet = 1,cols = 2:20, widths = 18)
+  
+  freezePane(wb, sheet = 2, firstRow = TRUE, firstCol = TRUE)
+  setColWidths(wb,sheet = 2,cols = 1:20, widths = 18)
+  
+  #Sty_money = createStyle(numFmt="$ 0,000")
+  
+  #addStyle(wb,sheet =  1,rows= 2:100000, style = Sty_money, cols = 5,gridExpand = TRUE)
+  #addStyle(wb,sheet =  1,rows= 2:100000, style = Sty_money, cols = 9,gridExpand = TRUE)
+  #addStyle(wb,sheet =  1,rows= 2:100000, style = Sty_money, cols = 12,gridExpand = TRUE)
+  #addStyle(wb,sheet =  1,rows= 2:100000, style = Sty_money, cols = 16,gridExpand = TRUE)
+  
+  
+  writeDataTable(wb,x=C1report, sheet=1, startRow = 7,tableStyle = "none",rowNames= FALSE)
+  writeDataTable(wb,x=VinDetails, sheet=2,rowNames= FALSE,headerStyle = hs)
+  saveWorkbook(wb,overwrite=TRUE, file=paste("F:/Projects/CAP1/Benchmarking/Monthly/CapitalOne_Portfolio_Details_asof_",as.Date(Sys.Date()),"_overLast_",substring((max(capitalone_portfolio$sale_date,na.rm=T)-min(capitalone_portfolio$sale_date,na.rm=T)),1,3),"days.xlsx",sep=""))
+  saveWorkbook(wb,overwrite=TRUE, file=paste("F:/SharedFolders/TW/CapitalOne/CapitalOne_Portfolio_Details_asof_",as.Date(Sys.Date()),"_overLast_",substring((max(capitalone_portfolio$sale_date,na.rm=T)-min(capitalone_portfolio$sale_date,na.rm=T)),1,3),"days.xlsx",sep=""))
+  
+}
+# END: Export  
+  
+# BEGIN: Comparsions
+COMPARSIONS=T;if(COMPARSIONS==T){
+  #Comparsion with Prior distributed report
+  #Current Month
+  current_report <- dir("F:\\SharedFolders\\TW\\CapitalOne\\")
+  current_report<-last(current_report[grep("CapitalOne_Portfolio_Details_asof_",current_report)],1)
+  current_report_summary<-read.xlsx(paste("F:\\SharedFolders\\TW\\CapitalOne\\",current_report,sep=""),sheet=1,detectDates = T)
+  current_report_details<-read.xlsx(paste("F:\\SharedFolders\\TW\\CapitalOne\\",current_report,sep=""),sheet=2,detectDates = T)
+  print(current_report)
+  #Prior Month
+  last_report <- dir("F:\\SharedFolders\\TW\\CapitalOne\\")
+  last_report<-first(last(last_report[grep("CapitalOne_Portfolio_Details_asof_",last_report)],2),1)
+  print(last_report)
+  prior_report_summary<-read.xlsx(paste("F:\\SharedFolders\\TW\\CapitalOne\\",last_report,sep=''),sheet=1,detectDates=T)
+  prior_report_details<-read.xlsx(paste("F:\\SharedFolders\\TW\\CapitalOne\\",last_report,sep=''),sheet=2,detectDates=T)
+  # merge with current
+  prior_report_details<-subset(prior_report_details,select=c(intersect(names(prior_report_details),names(current_report_details))))
+  #Compare 
+  prior_report_summary$month<-as.character(month(max(prior_report_details$sale_date),label=T))
+  current_report_summary$month<-as.character(month(max(current_report_details$sale_date),label=T))
+  prior_report_details$month<-as.character(month(max(prior_report_details$sale_date),label=T))
+  current_report_details$month<-as.character(month(max(current_report_details$sale_date),label=T))
+  
+  comparsions.df<-rbind(prior_report_summary,current_report_summary)
+  vincomparsions.df<-rbind(prior_report_details,
+                           subset(current_report_details,select=c(intersect(names(prior_report_details),names(current_report_details)))
+                                  )
+                           )
+
+  
+  cmonth<-as.character(month(max(current_report_details$sale_date),label=T))
+  pmonth<-as.character(month(max(prior_report_details$sale_date),label=T))
+  
+  #Compare by site
+  bySite=T;if(bySite==T){
+    byADESAReports<- data.frame(comparsions.df %>%
+                                  dplyr::group_by(Auction) %>%
+                                  summarise(
+                                    Total_ADESA_Units = Adesa_N[month==cmonth]
+                                    ,Total_ADESA_AMGRET = Adesa_AMG_retention[month==cmonth]
+                                    ,Offered_ADESA_Diff = Adesa_N[month==cmonth]-Adesa_N[month==pmonth]
+                                    ,Offered_Pct_Diff = round((Adesa_N[month==cmonth]/Adesa_N[month==pmonth])-1,2)
+                                    ,Conversion_monthly = Adesa_conversion[month==cmonth]
+                                    ,Conversion_ADESA_Diff = Adesa_conversion[month==cmonth]-Adesa_conversion[month==pmonth]
+                                    ,Retention_ADESA_Diff = Adesa_AMG_retention[month==cmonth]-Adesa_AMG_retention[month==pmonth]
+                                  ) %>% arrange(desc(Retention_ADESA_Diff)))  
+    #retention changes                        
+    mar<-byADESAReports %>% filter(abs(Retention_ADESA_Diff)>1) %>% select(Auction,Total_ADESA_AMGRET,Retention_ADESA_Diff)
+    #conversion changes
+    mac<-byADESAReports %>% filter(Conversion_ADESA_Diff>.05) %>% select(Auction,Conversion_monthly,Conversion_ADESA_Diff)
+    # volume changes
+    mav<-byADESAReports %>% filter(Offered_ADESA_Diff > Total_ADESA_Units/12*1.05) %>% select(Auction,Offered_ADESA_Diff,Offered_ADESA_Diff)
+    
+    adesa_mc<-data.frame(merge(merge(mar,mac,by="Auction",all=T),mav,by="Auction",all=T))
+    
+    adesa_mc$r_trend <- ifelse(adesa_mc$Retention_ADESA_Diff > 0,
+                               '![](F:/Users/RE/green_up_arrow.png)',
+                               '![](F:/Users/RE/red_down_arrow.png)')
+    adesa_mc$c_trend <- ifelse(adesa_mc$Conversion_ADESA_Diff > 0,
+                               '![](F:/Users/RE/green_up_arrow.png)',
+                               '![](F:/Users/RE/red_down_arrow.png)')
+    adesa_mc$v_trend <- ifelse(adesa_mc$Offered_ADESA_Diff > 0,
+                               '![](F:/Users/RE/green_up_arrow.png)',
+                               '![](F:/Users/RE/red_down_arrow.png)')
+    adesa_mc[is.na(adesa_mc)]<-''
+    adesa_mc<-adesa_mc %>% select(Auction,r_trend,c_trend,v_trend)
+    dimnames(adesa_mc)[[2]]<-c('Auction','Retention','Conversion','Volume')
+    
+    byCAPReports<-data.frame(comparsions.df %>%
+                               dplyr::group_by(Auction) %>%
+                               summarise(
+                                 Total_CAP_Units = Cap1_N[month==cmonth]
+                                 ,Total_CAP_AMGRET = Cap1_AMG_retention[month==cmonth]
+                                 ,Offered_CAP_Diff = Cap1_N[month==cmonth]-Cap1_N[month==pmonth]
+                                 ,Offered_Pct_Diff = round((Cap1_N[month==cmonth]/Cap1_N[month==pmonth])-1,2)
+                                 ,Conversion_CAP_Diff = Cap1_conversion[month==cmonth]-Cap1_conversion[month==pmonth]
+                                 ,Retention_CAP_Diff = Cap1_AMG_retention[month==cmonth]-Cap1_AMG_retention[month==pmonth]
+                                 
+                               ) %>% arrange(desc(Retention_CAP_Diff)))
+    byCAPReports    
+    
+    #retention changes                        
+    mr<-byCAPReports %>% filter(abs(Retention_CAP_Diff)>1) %>% select(Auction,Retention_CAP_Diff)
+    #conversion changes
+    mc<-byCAPReports %>% filter(Conversion_CAP_Diff>.05) %>% select(Auction,Conversion_CAP_Diff)
+    # volume changes
+    mv<-byCAPReports %>% filter(Offered_CAP_Diff > Total_CAP_Units/12*1.05) %>% select(Auction,Offered_CAP_Diff)
+    
+    capone_mc<-data.frame(merge(merge(mr,mc,by="Auction",all=T),mv,by="Auction",all=T))
+    
+    capone_mc$r_trend <- ifelse(capone_mc$Retention_CAP_Diff > 0,
+                                '![](F:/Users/RE/green_up_arrow.png)',
+                                '![](F:/Users/RE/red_down_arrow.png)')
+    capone_mc$c_trend <- ifelse(capone_mc$Conversion_CAP_Diff > 0,
+                                '![](F:/Users/RE/green_up_arrow.png)',
+                                '![](F:/Users/RE/red_down_arrow.png)')
+    capone_mc$v_trend <- ifelse(capone_mc$Offered_CAP_Diff > 0,
+                                '![](F:/Users/RE/green_up_arrow.png)',
+                                '![](F:/Users/RE/red_down_arrow.png)')
+    capone_mc[is.na(capone_mc)]<-''
+    capone_mc<-capone_mc %>% select(Auction,r_trend,c_trend,v_trend)
+    dimnames(capone_mc)[[2]]<-c('Auction','Retention','Conversion','Volume')
+  }
+  
+  #compare by Makes
+  byOEMgroups=T;if(byOEMgroups==T){
+    
+    byOEM<- data.frame(vincomparsions.df %>% 
+                         dplyr::group_by(vin,make_nm,sellgroup) %>%
+                         summarise(amg_change = (AMG_value[month==cmonth]/AMG_value[month==pmonth])-1) %>%
+                         group_by(sellgroup,make_nm) %>%
+                         summarise(AVG_CNG=round(mean(amg_change,na.rm=T),3)
+                                   ,N=length(vin)) %>%
+                         arrange(sellgroup,desc(AVG_CNG)) %>% filter(abs(AVG_CNG)>=0.02 & N>50)
+    )
+    
+    byOEM
+  }
+  
+  
+  byMonthlyReports=T;if(byMonthlyReports==T){
+    
+    byCurrentM<-data.frame(current_report_details %>% 
+                             filter(seller_name == 'CAPITAL ONE AUTO FINANCE' 
+                                    & ceiling_date(sale_date,"month")-1 == max(ceiling_date(sale_date,"month")-1,na.rm=T)) %>%
+                             dplyr::group_by(auction_name) %>%
+                             summarise(
+                               Total_Volume = length(unique(vin))
+                               ,AVG_SalePrice = mean(sale_price,na.rm=T)
+                               ,AVG_AMG_Retention = mean(AMG_retention,na.rm=T)
+                               ,CI95_lower = mean(AMG_retention,na.rm=T)-1.96*sd(AMG_retention,na.rm=T)/sqrt(length(unique(vin)))
+                               ,CI95_upper = mean(AMG_retention,na.rm=T)+1.96*sd(AMG_retention,na.rm=T)/sqrt(length(unique(vin)))
+                             ) %>% 
+                             filter(Total_Volume > 10) %>%
+                             arrange(desc(auction_name)))
+    byCurrentM  
+    
+    byCPriorM<-data.frame(current_report_details %>% 
+                            filter(seller_name == 'CAPITAL ONE AUTO FINANCE' 
+                                   & ceiling_date(sale_date,"month")-1 == max(ceiling_date(sale_date,"month")-1,na.rm=T)) %>%
+                            dplyr::group_by(auction_name) %>%
+                            summarise(
+                              Total_Volume = length(unique(vin))
+                              ,AVG_SalePrice = mean(sale_price,na.rm=T)
+                              ,AVG_AMG_Retention = mean(AMG_retention,na.rm=T)
+                              ,CI95_lower = mean(AMG_retention,na.rm=T)-1.96*sd(AMG_retention,na.rm=T)/sqrt(length(unique(vin)))
+                              ,CI95_upper = mean(AMG_retention,na.rm=T)+1.96*sd(AMG_retention,na.rm=T)/sqrt(length(unique(vin)))
+                            )%>% 
+                            filter(Total_Volume > 10) %>%
+                            arrange(desc(auction_name)))
+    byCPriorM
+    
+    byLPriorM<-data.frame(prior_report_details %>% 
+                            filter(seller_name == 'CAPITAL ONE AUTO FINANCE' 
+                                   & ceiling_date(sale_date,"month")-1 == max(ceiling_date(sale_date,"month")-1,na.rm=T)) %>%
+                            dplyr::group_by(auction_name) %>%
+                            summarise(
+                              Total_Volume = length(unique(vin))
+                              ,AVG_SalePrice = mean(sale_price,na.rm=T)
+                              ,AVG_AMG_Retention = mean(AMG_retention,na.rm=T)
+                              ,CI95_lower = mean(AMG_retention,na.rm=T)-1.96*sd(AMG_retention,na.rm=T)/sqrt(length(unique(vin)))
+                              ,CI95_upper = mean(AMG_retention,na.rm=T)+1.96*sd(AMG_retention,na.rm=T)/sqrt(length(unique(vin)))
+                              
+                            ) %>% 
+                            filter(Total_Volume > 1) %>%
+                            arrange(desc(auction_name)))
+    byLPriorM
+    
+    #Did retention change MoM?
+    #Significant decrease in retention
+    #byCurrentM[which(byCurrentM$CI95_upper < byLPriorM$CI95_lower),]
+    #Significant increase in retention
+    #byCurrentM[which(byLPriorM$CI95_upper < byCurrentM$CI95_lower),]
+    
+  }
+}
+# END: Comparsions
+
+# BEGIN: Markdowndown
+MARKDOWN=T;if(MARKDOWN == T){
+  markdown_path<- "F:/Projects/CAP1/Benchmarking/Monthly/CapitalOne_benchmarking_EKS.rmd"
+  Sys.setenv(RSTUDIO_PANDOC="C:/Program Files/RStudio/bin/pandoc")
+  
+  rmarkdown::render(markdown_path,  
+                    output_file =  paste("CapitalOne_Portfolio_Auction_Report_",as.Date(Sys.Date()),".html", sep='') 
+                    ,output_dir = "F:/Projects/CAP1/Benchmarking/Monthly/"
+                    ,output_format = c("html_document"))
+  
+  
+}
+# END: Markdowndown
